@@ -368,12 +368,13 @@ async function main() {
   console.log(`  2. Mining`);
   console.log(`  3. Claim`);
   console.log(`  4. Task`);
-  const mode = await prompt('\nPilih (1/2/3/4): ');
-  if (!['1','2','3','4'].includes(mode)) { console.log('[!] Invalid'); return; }
+  console.log(`  5. Relink Twitter`);
+  const mode = await prompt('\nPilih (1/2/3/4/5): ');
+  if (!['1','2','3','4','5'].includes(mode)) { console.log('[!] Invalid'); return; }
 
   // Pilih sub-mode task kalau mode 1 atau 4
   let questMode = null;
-  if (mode === '1' || mode === '4') {
+  if (['1','4'].includes(mode)) {
     console.log(`\nTask mode:`);
     console.log(`  1. Daily`);
     console.log(`  2. Weekly`);
@@ -419,6 +420,16 @@ async function main() {
         totalGems += gems;
       } else if (mode === '4') {
         await doTasks(s, tag, s.username, questMode, s.twCreds, s.acctIdx);
+      } else if (mode === '5') {
+        if (!s.username) { console.log(`${tag} No username in usn.txt, skip`); }
+        else {
+          try {
+            const r = await api('POST', '/api/user/link-twitter', { twitterHandle: s.username }, s.address, s.token);
+            console.log(`${tag} Relinked: @${r.twitterHandle}`);
+          } catch (e) {
+            console.log(`${tag} Relink failed: ${e.message}`);
+          }
+        }
       }
     } catch (e) {
       console.error(`${tag} Error: ${e.message}`);
