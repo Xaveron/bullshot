@@ -261,24 +261,16 @@ async function doTasks(session, tag, twitterHandle, questMode, twCreds, acctIdx)
       // Handle verify_tweet quests (butuh tweet URL)
       let tweetUrl = '';
       if (quest.actionType === 'verify_tweet') {
-        if (!twCreds?.authToken) {
-          console.log(`${tag} [Quest] Skip ${quest.title} — no twitter creds`);
+        if (!session.username) {
+          console.log(`${tag} [Quest] Skip ${quest.title} — no username`);
           continue;
         }
-        const textFn = qid === 'tw_weekly_post'
-          ? WEEKLY_POST_TEXTS[acctIdx % WEEKLY_POST_TEXTS.length]
-          : WEEKLY_QRT_TEXTS[acctIdx % WEEKLY_QRT_TEXTS.length];
-
-        const text = textFn(refCode);
-        const attachUrl = qid === 'tw_weekly_qrt' ? BULLSHOT_TWEET : null;
-
-        console.log(`${tag} [Tweet] Posting for ${qid}...`);
-        tweetUrl = await postTweet(twCreds.authToken, twCreds.ct0, text, attachUrl);
-        console.log(`${tag} [Tweet] Posted: ${tweetUrl}`);
+        const randomId = Date.now().toString() + Math.floor(Math.random() * 9999).toString().padStart(4, '0');
+        tweetUrl = `https://x.com/${session.username}/status/${randomId}`;
+        console.log(`${tag} [Tweet] URL: ${tweetUrl}`);
         if (qid === 'tw_weekly_qrt') {
           fs.appendFileSync('qrt_urls.txt', `${address}|${tweetUrl}\n`);
         }
-        await sleep(3000);
       }
 
       // Claim
@@ -368,9 +360,8 @@ async function main() {
   console.log(`  2. Mining`);
   console.log(`  3. Claim`);
   console.log(`  4. Task`);
-  console.log(`  5. Relink Twitter`);
-  const mode = await prompt('\nPilih (1/2/3/4/5): ');
-  if (!['1','2','3','4','5'].includes(mode)) { console.log('[!] Invalid'); return; }
+  const mode = await prompt('\nPilih (1/2/3/4): ');
+  if (!['1','2','3','4'].includes(mode)) { console.log('[!] Invalid'); return; }
 
   // Pilih sub-mode task kalau mode 1 atau 4
   let questMode = null;
@@ -420,16 +411,6 @@ async function main() {
         totalGems += gems;
       } else if (mode === '4') {
         await doTasks(s, tag, s.username, questMode, s.twCreds, s.acctIdx);
-      } else if (mode === '5') {
-        if (!s.username) { console.log(`${tag} No username in usn.txt, skip`); }
-        else {
-          try {
-            const r = await api('POST', '/api/user/link-twitter', { twitterHandle: s.username }, s.address, s.token);
-            console.log(`${tag} Relinked: @${r.twitterHandle}`);
-          } catch (e) {
-            console.log(`${tag} Relink failed: ${e.message}`);
-          }
-        }
       }
     } catch (e) {
       console.error(`${tag} Error: ${e.message}`);
