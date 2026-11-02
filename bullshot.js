@@ -4,33 +4,9 @@ const readline = require('readline');
 
 const BASE_URL = 'https://gemapi.bullshot.io';
 const REF_CODE  = '0x413c3593';
-const TW_BEARER = 'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
-const BULLSHOT_TWEET = 'https://twitter.com/Bullshot911/status/2114813596278604001';
-
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const randomDelay = (min = 3000, max = 8000) => sleep(min + Math.random() * (max - min));
 const accountDelay = () => sleep(2000 + Math.random() * 4000);
-
-// ─── TWEET TEXTS ─────────────────────────────────────────────────────────────
-const WEEKLY_POST_TEXTS = [
-  ref => `Another solid week stacking GEMS and upgrading miners on @Bullshot911! ⚒️🔥\n\nBull GEM on Base is easily the smoothest idle miner right now. Check it out: https://gem.bullshot.io/r/${ref}\n\n#Bullshot #BullGems #BaseChain`,
-  ref => `Weekly grind secured! Mining GEMS nonstop with @Bullshot911 on Base ⛏️💎\n\nIf you're not mining Bull GEM yet, you're missing out: https://gem.bullshot.io/r/${ref}\n\n#BullGems #Bullshot #BaseChain`,
-  ref => `Stack week complete! GEMS keep rolling in on @Bullshot911 ⚒️🔥\n\nBull GEM on Base hits different. Jump in: https://gem.bullshot.io/r/${ref}\n\n#Bullshot #BullGems #Base`,
-  ref => `Another week, another bag of GEMS from @Bullshot911! 💎⛏️\n\nIdling has never been this rewarding. Start mining: https://gem.bullshot.io/r/${ref}\n\n#BullGems #BaseChain #Bullshot`,
-  ref => `Weekly miners report: GEMS stacked, upgrades done, vibes immaculate 🔥⚒️\n\nJoin me on @Bullshot911 Bull GEM: https://gem.bullshot.io/r/${ref}\n\n#Bullshot #BullGems #BaseChain`,
-  ref => `7 days deep in the quarry with @Bullshot911. GEMS don't stop ⛏️🔥\n\nGet in early: https://gem.bullshot.io/r/${ref}\n\n#BullGems #Bullshot #Base`,
-  ref => `Miner grind never sleeps with @Bullshot911! Week after week on Base 💎⚒️\n\nStart here: https://gem.bullshot.io/r/${ref}\n\n#Bullshot #BullGems #BaseChain`,
-];
-
-const WEEKLY_QRT_TEXTS = [
-  ref => `Mining deep in the quarries with @Bullshot911! Don't sleep on Bull Gems on Base ⚒️💎\nhttps://gem.bullshot.io/r/${ref} #Bullshot`,
-  ref => `Still going strong in the mines! @Bullshot911 keeping the GEMS flowing 🔥⛏️\nhttps://gem.bullshot.io/r/${ref} #BullGems`,
-  ref => `Can't stop won't stop mining with @Bullshot911 💎⚒️ Bull GEM on Base is the play\nhttps://gem.bullshot.io/r/${ref} #Bullshot`,
-  ref => `Weekly check-in from the quarry! @Bullshot911 delivering every week 🔥\nhttps://gem.bullshot.io/r/${ref} #BullGems #BaseChain`,
-  ref => `Gems don't stop with @Bullshot911! Base chain mining at its finest ⛏️💎\nhttps://gem.bullshot.io/r/${ref} #Bullshot`,
-  ref => `Another week grinding GEMS alongside @Bullshot911 on Base 🔥⚒️\nhttps://gem.bullshot.io/r/${ref} #BullGems`,
-  ref => `@Bullshot911 never misses. Weekly GEMS secured 💎 Bull GEM on Base\nhttps://gem.bullshot.io/r/${ref} #Bullshot #BaseChain`,
-];
 
 // ─── PARSE AKUN.TXT ───────────────────────────────────────────────────────────
 function parseAkun() {
@@ -41,66 +17,6 @@ function parseAkun() {
     const lines = b.trim().split('\n').map(l => l.trim()).filter(Boolean);
     return { authToken: lines[0] || '', ct0: lines[1] || '' };
   }).filter(a => a.authToken && a.ct0);
-}
-
-// ─── TWITTER POST ─────────────────────────────────────────────────────────────
-const TW_QUERY_ID = '7TKRKCPuAGsmYde0CudbVg';
-const TW_FEATURES = {
-  communities_web_enable_tweet_community_results_fetch: true,
-  c9s_tweet_anatomy_moderator_badge_enabled: true,
-  responsive_web_edit_tweet_api_enabled: true,
-  graphql_is_translatable_rweb_tweet_is_translatable_enabled: true,
-  view_counts_everywhere_api_enabled: true,
-  longform_notetweets_consumption_enabled: true,
-  responsive_web_twitter_article_tweet_consumption_enabled: true,
-  tweet_awards_web_tipping_enabled: false,
-  creator_subscriptions_quote_tweet_preview_enabled: false,
-  longform_notetweets_rich_text_read_enabled: true,
-  longform_notetweets_inline_media_enabled: true,
-  articles_preview_enabled: true,
-  rweb_video_timestamps_enabled: true,
-  rweb_tipjar_consumption_enabled: true,
-  responsive_web_graphql_exclude_directive_enabled: true,
-  verified_phone_label_enabled: false,
-  freedom_of_speech_not_reach_the_sky_enabled: true,
-  standardized_nudges_misinfo: true,
-  tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled: true,
-  responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
-  responsive_web_graphql_timeline_navigation_enabled: true,
-  responsive_web_enhance_cards_enabled: false,
-};
-
-async function postTweet(authToken, ct0, text, attachUrl = null) {
-  const variables = {
-    tweet_text: text,
-    media: { media_entities: [], possibly_sensitive: false },
-    semantic_annotation_ids: [],
-    disallowed_reply_controls: [],
-    ...(attachUrl ? { attachment_url: attachUrl } : {}),
-  };
-
-  const res = await fetch(`https://api.x.com/graphql/${TW_QUERY_ID}/CreateTweet`, {
-    method: 'POST',
-    headers: {
-      'authorization': `Bearer ${TW_BEARER}`,
-      'cookie': `auth_token=${authToken}; ct0=${ct0}`,
-      'x-csrf-token': ct0,
-      'content-type': 'application/json',
-      'user-agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
-      'x-twitter-active-user': 'yes',
-      'x-twitter-client-language': 'id',
-      'origin': 'https://x.com',
-      'referer': 'https://x.com/',
-    },
-    body: JSON.stringify({ variables, features: TW_FEATURES, queryId: TW_QUERY_ID }),
-  });
-
-  const data = await res.json();
-  if (data.errors) throw new Error(JSON.stringify(data.errors));
-  const tweetId = data?.data?.create_tweet?.tweet_results?.result?.rest_id;
-  if (!tweetId) throw new Error('No tweet ID: ' + JSON.stringify(data));
-  const username = data?.data?.create_tweet?.tweet_results?.result?.core?.user_results?.result?.legacy?.screen_name;
-  return `https://x.com/${username}/status/${tweetId}`;
 }
 
 // ─── BULLSHOT API ─────────────────────────────────────────────────────────────
