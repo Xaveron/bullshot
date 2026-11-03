@@ -1,740 +1,653 @@
 const { Wallet } = require('ethers');
 const fs = require('fs');
+const path = require('path');
 const readline = require('readline');
 
-const BASE_URL = 'https://gemapi.bullshot.io';
-const REF_CODE  = '0x413c3593';
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const randomDelay = (min = 3000, max = 8000) => sleep(min + Math.random() * (max - min));
-const accountDelay = () => sleep(2000 + Math.random() * 4000);
-
-// ─── PARSE AKUN.TXT ───────────────────────────────────────────────────────────
-function parseAkun() {
-  if (!fs.existsSync('akun.txt')) return [];
-  const raw = fs.readFileSync('akun.txt', 'utf-8').trim();
-  const blocks = raw.split(/\n\s*\n/);
-  return blocks.map(b => {
-    const lines = b.trim().split('\n').map(l => l.trim()).filter(Boolean);
-    return { authToken: lines[0] || '', ct0: lines[1] || '' };
-  }).filter(a => a.authToken && a.ct0);
+// ─── CONFIG (.env) ────────────────────────────────────────────────────────────
+function loadEnv(file = path.join(__dirname, '.env')) {
+  if (!fs.existsSync(file)) {
+    console.error(`[!] ${file} not found. Copy .env.example to .env and fill it in.`);
+    process.exit(1);
+  }
+  for (const line of fs.readFileSync(file, 'utf-8').split(/\r?\n/)) {
+    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/i);
+    if (!m || line.trim().startsWith('#')) continue;
+    let val = m[2];
+    if (/^(['"]).*\1$/.test(val)) val = val.slice(1, -1);
+    if (!(m[1] in process.env)) process.env[m[1]] = val;
+  }
 }
 
+const list = v => (v || '').split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+const num = (v, def) => (Number.isFinite(Number(v)) && v !== '' ? Number(v) : def);
+
+// "[600,700]" → [600, 700]; a single number "500" → [500, 500]
+function range(v, def) {
+  const nums = (v || '').replace(/[\[\]\s]/g, '').split(/[,;]/).filter(Boolean).map(Number);
+  if (!nums.length || nums.some(n => !Number.isFinite(n) || n < 0)) return def;
+  const [a, b = a] = nums;
+  return [Math.min(a, b), Math.max(a, b)];
+}
+
+loadEnv();
+
+const CFG = {
+  baseUrl:     process.env.BASE_URL || 'https://gemapi.bullshot.io',
+  refCode:     process.env.REF_CODE || '',
+  keys:        list(process.env.PRIVATE_KEYS).map(k => (k.startsWith('0x') ? k : `0x${k}`)),
+  usernames:   list(process.env.TWITTER_USERNAMES).map(u => u.replace(/^@/, '')),
+  delay:       range(process.env.DELAY_MS, [3000, 8000]),
+  acctDelay:   range(process.env.ACCOUNT_DELAY_MS, [2000, 6000]),
+  minDuration: num(process.env.MIN_LOCATION_SECONDS, 600),
+  locations:   list(process.env.MINING_LOCATIONS), // location id priority; empty = auto (max GEMS)
+  timeout:     num(process.env.REQUEST_TIMEOUT_MS, 60000),
+  retries:     num(process.env.REQUEST_RETRIES, 2),
+  // Auto mode (seconds)
+  autoExtra:   range(process.env.AUTO_EXTRA_WAIT_SEC, [30, 180]),
+  autoIdle:    range(process.env.AUTO_IDLE_WAIT_SEC, [1800, 3600]),
+  autoMinWait: num(process.env.AUTO_MIN_WAIT_SEC, 60),
+  autoMaxWait: num(process.env.AUTO_MAX_WAIT_SEC, 3600),
+  autoCycles:  num(process.env.AUTO_CYCLES, 0), // 0 = infinite
+  gemsReserve: num(process.env.AUTO_GEMS_RESERVE, 500), // mode 8: GEMS never spent
+};
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const rand = (min, max) => min + Math.random() * Math.max(0, max - min);
+const randomDelay = () => sleep(rand(...CFG.delay));
+const accountDelay = () => sleep(rand(...CFG.acctDelay));
+
 // ─── BULLSHOT API ─────────────────────────────────────────────────────────────
-function getHeaders(address = '', token = '') {
+function getHeaders(address, token) {
   return {
     'Content-Type': 'application/json',
     'Origin': 'https://gem.bullshot.io',
     'Referer': 'https://gem.bullshot.io/',
-    'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
     ...(address ? { 'X-Wallet-Address': address } : {}),
-    ...(token   ? { 'Authorization': `Bearer ${token}` } : {}),
+    ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
   };
 }
 
-function isNetworkError(e) {
-  return /fetch failed|aborted|network|ECONN|ETIMEDOUT|socket hang up|timeout/i.test(e?.message || '');
-}
-
-// Retry khusus error network (bukan error server): dipakai quest start/
-// claim di bawah, dan polanya sama dengan retry deploy mining. Kalau
-// server yang menolak (pesan server), langsung throw tanpa retry.
-async function apiRetry(method, path, body, address, token, tag, label) {
-  for (let attempt = 1; attempt <= 3; attempt++) {
+async function api(method, urlPath, body, address, token) {
+  for (let attempt = 0; ; attempt++) {
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), CFG.timeout);
     try {
-      return await api(method, path, body, address, token);
+      const res = await fetch(`${CFG.baseUrl}${urlPath}`, {
+        method,
+        headers: getHeaders(address, token),
+        signal: ctrl.signal,
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      const text = await res.text();
+      let data;
+      try { data = text ? JSON.parse(text) : {}; } catch { data = null; }
+
+      // 429 / 5xx — retry
+      if ((res.status === 429 || res.status >= 500) && attempt < CFG.retries) {
+        await sleep(3000 * (attempt + 1));
+        continue;
+      }
+      if (data === null) throw new Error(`HTTP ${res.status}, non-JSON: ${text.slice(0, 100)}`);
+      if (!res.ok) throw new Error(data.message || data.error || `HTTP ${res.status}`);
+      return data;
     } catch (e) {
-      if (!isNetworkError(e) || attempt === 3) throw e;
-      console.log(`${tag} [Quest] ${label} gagal network (percobaan ${attempt}/3): ${e.message} | retry 5 detik...`);
-      await sleep(5000);
+      const retriable = e.name === 'AbortError' || e.cause?.code;
+      if (retriable && attempt < CFG.retries) {
+        await sleep(3000 * (attempt + 1));
+        continue;
+      }
+      if (e.name === 'AbortError') throw new Error(`Timeout ${method} ${urlPath}`);
+      throw e;
+    } finally {
+      clearTimeout(to);
     }
   }
 }
 
-async function api(method, path, body, address, token) {
-  const ctrl = new AbortController();
-  // Timeout dinaikkan dari 15000 ke 60000: "This operation was aborted"
-  // di run user 2026-11-03 itu AbortController yang memutus fetch karena
-  // server / jaringan lambat lebih dari 15 detik, bukan karena server
-  // menolak. Retry di doMining memang sudah menangkap "aborted", tapi
-  // kalau server konsisten lambat >15 detik, retry dengan timeout yang
-  // sama juga akan abort lagi — jadi timeout-nya sendiri yang harus naik.
-  const to = setTimeout(() => ctrl.abort(), 60000);
-  try {
-    const res = await fetch(`${BASE_URL}${path}`, {
-      method,
-      headers: getHeaders(address, token),
-      signal: ctrl.signal,
-      ...(body ? { body: JSON.stringify(body) } : {}),
-    });
-    const text = await res.text();
-    let data;
-    try { data = JSON.parse(text); } catch { throw new Error(`Non-JSON: ${text.slice(0, 100)}`); }
-    if (!res.ok) throw new Error(data?.message || `HTTP ${res.status}`);
-    return data;
-  } finally { clearTimeout(to); }
-}
+const asArray = v => (Array.isArray(v) ? v : Array.isArray(v?.data) ? v.data : []);
 
 // ─── LOGIN ────────────────────────────────────────────────────────────────────
 async function login(privateKey) {
-  const wallet = new Wallet(privateKey.trim());
+  const wallet = new Wallet(privateKey);
   const address = wallet.address;
+
   const ban = await api('GET', `/api/user/check-ban/${address}`, null, address);
-  if (ban.banned || ban.isBanned) throw new Error('BANNED');
+  if (ban.banned || ban.isBanned) throw new Error('wallet is banned');
+
   const { message } = await api('POST', '/api/auth/nonce', { walletAddress: address }, address);
   const signature = await wallet.signMessage(message);
   const { token, user } = await api('POST', '/api/auth/login', {
-    walletAddress: address, message, signature, refCode: REF_CODE,
+    walletAddress: address, message, signature,
+    ...(CFG.refCode ? { refCode: CFG.refCode } : {}),
   }, address);
-  return { address, token, user };
+
+  if (!token) throw new Error('server returned no token');
+  return { address, token, user: user || {} };
 }
 
 // ─── MINING ───────────────────────────────────────────────────────────────────
-function pickLocation(locations, energy, miningPower) {
-  // CATATAN PENTING: isLocked TIDAK dipakai sebagai filter lagi.
-  // Bukti dari Network tab user 2026-11-03: GET /api/mining/locations
-  // bilang Crystal Cavern locked:true, tapi POST /api/mining/positions
-  // manual dengan { locationId: "crystal-cavern" } di akun yang sama
-  // tetap 200 OK dan posisi aktif (durasi 1800). Jadi flag isLocked
-  // itu tidak ditegakkan oleh endpoint POST — yang jadi penentu akhir
-  // adalah POST itu sendiri (kalau benar-benar tidak bisa, POST gagal
-  // dan loop berhenti di "Mining stop"). Kolam lain tetap ke-skip
-  // karena syarat power/energy/durasi: Ember butuh power 60, Frozen 120,
-  // Void 250, sementara power akun utama 27.
-  return locations
-    .filter(l => l.name && l.durationSeconds >= 600
-      && l.energyCost <= energy && l.miningPowerRequired <= miningPower)
-    .sort((a, b) => {
-      const g = (b.rewardRanges?.GEMS?.max || 0) - (a.rewardRanges?.GEMS?.max || 0);
-      return g !== 0 ? g : b.durationSeconds - a.durationSeconds;
-    })[0] || null;
+// The server's isLocked flag does not reflect the account (Crystal Cavern is locked:true
+// at level 7 / power 50), so we check the real requirements: levelRequired and miningPowerRequired.
+// Locations the server still rejects are remembered and not tried again.
+const rejectedLocs = new Map(); // address → Set(locationId)
+
+function bestLocation(locations, level, miningPower, address) {
+  const rejected = rejectedLocs.get(address) || new Set();
+  const ok = locations.filter(l => l.name && l.durationSeconds >= CFG.minDuration
+    && !rejected.has(l.id)
+    && (l.miningPowerRequired || 0) <= miningPower
+    && (level === undefined || (l.levelRequired || 0) <= level));
+
+  if (CFG.locations.length) {
+    // Priority from .env: the first one the account qualifies for
+    return CFG.locations.map(id => ok.find(l => l.id === id)).find(Boolean) || null;
+  }
+  return ok.sort((a, b) =>
+    (b.rewardRanges?.GEMS?.max || 0) - (a.rewardRanges?.GEMS?.max || 0)
+    || b.durationSeconds - a.durationSeconds)[0] || null;
 }
 
-async function doMining(session, tag) {
-  // Auto saja (pickLocation, reward terbesar yang lolos): pilihan paksa
-  // Crystal sempat ditambahkan lalu dibatalkan user 2026-11-03 karena
-  // auto untuk akun utama memang sudah Crystal dulu, Greenstone hanya
-  // untuk sisa energy / akun yang tidak lolos Crystal.
-  const { address, token } = session;
+function soonest(positions) {
+  return [...positions].sort((a, b) => a.remainingSeconds - b.remainingSeconds)[0];
+}
 
-  const positions = await api('GET', '/api/mining/positions', null, address, token);
-  const active = positions.filter(p => p.status === 'active');
-  if (active.length > 0) {
-    const soonest = active.sort((a, b) => a.remainingSeconds - b.remainingSeconds)[0];
-    console.log(`${tag} Active: ${active.length} position(s) | soonest done in ${soonest.remainingSeconds}s`);
+async function doMining(s, tag) {
+  const { address, token } = s;
+
+  const active = asArray(await api('GET', '/api/mining/positions', null, address, token))
+    .filter(p => p.status === 'active');
+  if (active.length) {
+    console.log(`${tag} Active positions: ${active.length} | next done in ${soonest(active).remainingSeconds}s`);
   }
 
-  const [locations, stats] = await Promise.all([
+  const [locRaw, stats] = await Promise.all([
     api('GET', '/api/mining/locations', null, address, token),
     api('GET', '/api/mining/stats', null, address, token),
   ]);
+  const locations = asArray(locRaw);
 
-  let energy = stats.energy;
+  let energy = stats.energy ?? 0;
   let started = 0;
+  const level = stats.level ?? s.user.level;
 
-  // DEBUG LOKASI: hanya tampilkan kolam yang ELIGIBLE, sesuai permintaan
-  // user 2026-11-03 ("yang masih ke-lock buang aja"). Kolam yang ke-lock
-  // / ke-skip (Ember, Frozen, Void, cave tanpa nama, dll) tidak ditampilkan
-  // lagi, cuma dihitung di satu baris ringkas. locked di sini hanya info,
-  // BUKAN alasan skip lagi (lihat komentar di pickLocation: POST manual
-  // Crystal berhasil walau locations bilang locked:true, jadi Crystal
-  // tetap tampil sebagai ELIGIBLE walau locked:true).
-  {
-    const statParts = [`energy: ${stats.energy}`, `miningPower: ${stats.miningPower}`];
-    if (stats.level !== undefined) statParts.push(`level: ${stats.level}`);
-    console.log(`${tag} [Lokasi] Stats: ${statParts.join(' | ')}`);
-    let skipped = 0;
-    (Array.isArray(locations) ? locations : []).forEach(l => {
-      const reasons = [];
-      if (!l.name) reasons.push('tanpa nama');
-      if (l.durationSeconds !== undefined && l.durationSeconds < 600) reasons.push(`durasi ${l.durationSeconds}<600`);
-      if (l.energyCost !== undefined && l.energyCost > energy) reasons.push(`energyCost ${l.energyCost} > energy ${energy}`);
-      if (l.miningPowerRequired !== undefined && l.miningPowerRequired > stats.miningPower) reasons.push(`powerRequired ${l.miningPowerRequired} > power ${stats.miningPower}`);
-      if (reasons.length > 0) { skipped++; return; }
-      const rewardMax = l.rewardRanges?.GEMS?.max;
-      // Tampilkan id juga, supaya payload yang akan dikirim ({ locationId:
-      // id }) bisa dicek langsung: untuk Crystal harusnya "crystal-cavern",
-      // sama seperti payload manual yang terbukti 200 OK.
-      console.log(`${tag} [Lokasi] ${l.name || '-'} (id: ${l.id}) | locked: ${!!l.isLocked} | durasi: ${l.durationSeconds} | energyCost: ${l.energyCost} | powerRequired: ${l.miningPowerRequired} | rewardMax: ${rewardMax !== undefined ? rewardMax : '-'} | ELIGIBLE`);
-    });
-    if (skipped > 0) console.log(`${tag} [Lokasi] ${skipped} lokasi lain di-skip (tidak ditampilkan)`);
-  }
-
-  while (true) {
-    const loc = pickLocation(locations, energy, stats.miningPower);
+  for (;;) {
+    // Take the best available location; if there is not enough energy for it, wait
+    // instead of spending energy on a cheaper one (Crystal: 45 GEMS / 20 energy beats Greenstone: 15 / 10)
+    const loc = bestLocation(locations, level, stats.miningPower ?? 0, address);
     if (!loc) {
-      if (started === 0) console.log(`${tag} No location available (energy: ${energy})`);
+      if (!started) console.log(`${tag} No suitable location (level: ${level ?? '?'}, power: ${stats.miningPower ?? '?'})`);
       break;
     }
-    // Deploy dengan retry khusus untuk error network ("fetch failed",
-    // abort, timeout, dsb): error seperti itu di run user 2026-11-03
-    // bikin mining berhenti setelah 1 posisi Crystal padahal energy
-    // masih 80. Error dari server (mis. energy habis, posisi penuh)
-    // tidak di-retry, langsung stop seperti dulu.
-    let deployed = false;
-    let lastError = null;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        await api('POST', '/api/mining/positions', { locationId: loc.id }, address, token);
-        deployed = true;
-        break;
-      } catch (e) {
-        lastError = e;
-        const isNetwork = /fetch failed|aborted|network|ECONN|ETIMEDOUT|socket hang up|timeout/i.test(e.message);
-        if (!isNetwork) break;
-        console.log(`${tag} Mining deploy gagal (percobaan ${attempt}/3): ${e.message} | retry dalam 5 detik...`);
-        if (attempt < 3) await sleep(5000);
-      }
-    }
-    if (!deployed) {
-      console.log(`${tag} Mining stop: ${lastError ? lastError.message : 'deploy gagal'}`);
+    if (loc.energyCost > energy) {
+      if (!started) console.log(`${tag} ${loc.name}: needs ${loc.energyCost} energy, have ${energy} — waiting`);
       break;
     }
-    started++;
-    energy -= loc.energyCost;
-    console.log(`${tag} [⛏${started}] ${loc.name} | ${loc.durationSeconds}s | energy sisa: ${energy}`);
-    await randomDelay();
-  }
-
-  if (started > 0) console.log(`${tag} Total started: ${started} position(s)`);
-}
-
-// ─── TASK ─────────────────────────────────────────────────────────────────────
-// questMode: 'daily' | 'weekly' | 'oneTime'
-// One-time dicek dari GET /api/quests (field 'oneTime', bukan 'one_time'):
-//  - tw_follow_bullshot : intent, follow @Bullshot911 di X, 300 / 150 XP
-//                         (gerbangnya link X di Miner Center, sudah ditangani
-//                         link-twitter di bawah; tidak ditemukan endpoint
-//                         verify_follow di API publik, jadi polanya start+claim)
-//  - tg_join_bullshot   : intent, join https://t.me/Bullshot9, 300 / 150 XP
-//                         (TIDAK ada gerbang link Telegram di API publik:
-//                         tidak ada field userTelegramLinked / tombol link
-//                         Telegram, jadi TIDAK pakai sessions Telegram,
-//                         polanya sama: start, tunggu delay, claim)
-//  - dc_join_bullshot   : intent, join Discord, 300 / 150 XP (pola sama)
-//  - tw_start_mining_tweet : verify_tweet, 450 / 225 XP
-//                         (pakai tweetUrl seperti quest verify_tweet lainnya)
-async function doTasks(session, tag, twitterHandle, questMode, twCreds, acctIdx) {
-  const { address, token, user } = session;
-  const refCode = user.refCode || REF_CODE;
-
-  // Link twitter kalau belum
-  if (twitterHandle && !user.twitterHandle) {
     try {
-      const r = await api('POST', '/api/user/link-twitter', { twitterHandle }, address, token);
-      console.log(`${tag} [Twitter] Linked: @${r.twitterHandle}`);
-    } catch (e) {
-      console.log(`${tag} [Twitter] Link failed: ${e.message}`);
-    }
-    await randomDelay();
-  }
-
-  // Get quests
-  let raw;
-  try {
-    raw = await api('GET', '/api/quests', null, address, token);
-  } catch (e) {
-    console.log(`${tag} [Quest] GET failed: ${e.message}`);
-    return;
-  }
-
-  const WHITELIST = {
-    daily:  ['daily_miner_signin', 'tw_daily_engage'],
-    weekly: ['tw_weekly_post', 'tw_weekly_qrt', 'weekly_miner_checkin'],
-    oneTime: ['tw_follow_bullshot', 'tg_join_bullshot', 'dc_join_bullshot', 'tw_start_mining_tweet'],
-  };
-
-  const pool = raw[questMode] || [];
-
-  const allowed = WHITELIST[questMode] || [];
-  const doable = pool.filter(q =>
-    allowed.includes(q.id) &&
-    ['available', 'in_progress', 'started', 'ready', 'pending'].includes(q.status)
-  );
-
-  if (doable.length === 0) {
-    console.log(`${tag} [Quest] Semua ${questMode} quest selesai`);
-    pool.filter(q => allowed.includes(q.id))
-        .forEach(q => console.log(`${tag}   └ ${q.id}: ${q.status}`));
-    return;
-  }
-
-  for (const quest of doable) {
-    const qid = quest.id;
-    try {
-      // Start hanya kalau masih available
-      if (quest.status === 'available') {
-        const started = await apiRetry('POST', '/api/quests/start', { questId: qid }, address, token, tag, `${quest.title} start`);
-        const wait = (started.delaySeconds || started.secondsLeft || 10) + 2;
-        console.log(`${tag} [Quest] Started: ${quest.title} | wait ${wait}s`);
-        await sleep(wait * 1000);
-      } else {
-        // Resume DULU langsung claim tanpa nunggu — itu penyebab 400 di
-        // jalan pertama untuk quest tweet (dan kemungkinan quest lain):
-        // server belum buka jendela claim-nya, claim ulang belakangan
-        // dengan URL yang sama baru berhasil. Jadi Resume sekarang juga
-        // nunggu dulu, sama seperti habis Start.
-        const wait = (quest.delaySeconds || quest.secondsLeft || 10) + 2;
-        console.log(`${tag} [Quest] Resume: ${quest.title} (${quest.status}) | wait ${wait}s`);
-        await sleep(wait * 1000);
-      }
-
-      // Handle verify_tweet quests (butuh tweet URL)
-      let tweetUrl = '';
-      if (quest.actionType === 'verify_tweet') {
-        if (!session.username) {
-          console.log(`${tag} [Quest] Skip ${quest.title} — no username`);
-          continue;
-        }
-        const randomId = Date.now().toString() + Math.floor(Math.random() * 9999).toString().padStart(4, '0');
-        tweetUrl = `https://x.com/${session.username}/status/${randomId}`;
-        console.log(`${tag} [Tweet] URL: ${tweetUrl}`);
-        if (qid === 'tw_weekly_qrt') {
-          fs.appendFileSync('qrt_urls.txt', `${address}|${tweetUrl}\n`);
-        }
-      }
-
-      // Claim, dengan satu retry khusus HTTP 400: kalau server menolak
-      // karena jendela claim belum buka, tunggu 15 detik lalu coba lagi
-      // dengan tweetUrl YANG SAMA (bukan URL acak baru — manual dengan
-      // URL yang sama belakangan terbukti berhasil). Kalau retry kedua
-      // juga 400, error-nya dilempar ke catch di bawah seperti dulu.
-      let claimed;
-      try {
-        claimed = await apiRetry('POST', '/api/quests/claim', { questId: qid, tweetUrl }, address, token, tag, `${quest.title} claim`);
-      } catch (e) {
-        if (/400/.test(e.message)) {
-          console.log(`${tag} [Quest] ${quest.title} claim 400, tunggu 15 detik lalu coba lagi dengan URL yang sama...`);
-          await sleep(15000);
-          claimed = await apiRetry('POST', '/api/quests/claim', { questId: qid, tweetUrl }, address, token, tag, `${quest.title} claim (retry 400)`);
-        } else {
-          throw e;
-        }
-      }
-      console.log(`${tag} [Quest] Claimed: ${quest.title} | +${claimed.reward?.gems || 0} GEMS +${claimed.reward?.xp || 0} XP`);
-    } catch (e) {
-      console.log(`${tag} [Quest] ${quest.title} error: ${e.message}`);
-    }
-    await randomDelay();
-  }
-}
-
-// ─── UPGRADE MINING ───────────────────────────────────────────────────────────
-// Sumber terverifikasi: GET /api/upgrades (API publik, tanpa login).
-// Daftar saat dicek (3 item, tier I saja):
-//  - upg-power-1  : Mining Power I    | type miningPower    | +5  | biaya 250
-//  - upg-energy-1 : Energy Capacity I | type energyCapacity | +20 | biaya 180
-//                   (extra: baseCost 180, maxCapacity 320, currentCapacity 100)
-//  - upg-speed-1  : Mining Speed I    | type miningSpeed    | +5  | biaya 350
-// PENTING, jangan diasumsikan:
-//  - API /api/upgrades TIDAK mengembalikan requiredLevel / unlockLevel /
-//    minLevel / level maksimum, dan TIDAK melabeli mata uang cost.
-//    Yang punya field levelRequired itu lokasi mining (mis. Crystal Cavern
-//    level 4, Ember Mine level 8, Void Rift level 20), BUKAN upgrade.
-//  - Endpoint beli TERVERIFIKASI dari Network tab user (bukan tebakan):
-//    POST /api/upgrades/{id} TANPA body (Content-Length 0), dengan header
-//    Authorization + X-Wallet-Address yang sama seperti api() di atas.
-//    Contoh: POST /api/upgrades/upg-power-1 -> 200, success true,
-//    "Successfully purchased Mining Power I!", user.miningPower +5.
-//    PEMBELIAN BISA DIULANG dengan endpoint + id yang SAMA: pembelian
-//    power ke-2 tetap POST /api/upgrades/upg-power-1, cost 250, +5 lagi
-//    (power 7 -> 12, gems 3694.25 -> 3444.25 di test user). Jadi tidak ada
-//    id tier II yang berubah — tiap klik beli = 1x increment.
-//    PERHATIAN BIAYA: patokan biaya adalah cost dari GET /api/upgrades
-//    per akun, BUKAN cost di respons beli. Contoh energy di test user:
-//    GET cost 360 dan gems turun 360, padahal respons beli menulis cost
-//    180. Karena itu log di bawah menampilkan GET cost + gems respons.
-//  - Mode ini SEKARANG BENAR-BENAR MEMBELI: N x per upgrade terpilih per
-//    akun, dengan N = pilihan "berapa kali" di menu mode 5 (default 1).
-//    Pilih "Semua" = beli 3 upgrade (power, energy, speed) masing-
-//    masing N x per akun. Jalankan dulu dengan scope 1 akun untuk test.
-//    Total spend per akun = N x GET cost per upgrade terpilih.
-//  - AKUN BEDA LEVEL: fungsi ini dipanggil per akun, dengan token akun itu
-//    sendiri (lihat loop di main: satu akun gagal tidak menghentikan akun
-//    lain). Jadi JANGAN hardcode satu ambang level global di menu / di sini.
-//    Yang jadi patokan adalah daftar yang dikembalikan server untuk akun
-//    itu: kalau satu tier belum muncul / belum eligible untuk akun itu,
-//    akun itu di-skip untuk tier tersebut, akun lain yang sudah eligible
-//    tetap jalan. Contoh perumpamaan level 5 -> tier B, level 8 -> tier A
-//    BUKAN data terverifikasi, jadi tidak ditulis sebagai aturan di kode.
-//  - BUKTI TEST LOGIN: Energy Capacity di satu akun tampil biaya 360 dan
-//    maxCapacity 1980, padahal API publik 180 / 320. Artinya harga dan
-//    kapasitas memang dinamis per akun — selalu pakai angka dari output
-//    per akun, bukan angka menu / API publik.
-async function doUpgrades(session, tag, upgradeType, repeatCount = 1) {
-  // Jumlah pengulangan yang dipilih di menu; 1 = perilaku lama (1x).
-  repeatCount = Math.max(1, parseInt(repeatCount) || 1);
-  // Hasil per percobaan, dipakai ringkasan akhir di main(): { upgrade,
-  // attempt, total, status: 'BERHASIL'|'GAGAL'|'SKIP', detail }.
-  const results = [];
-  const { address, token, user } = session;
-  // Info level akun kalau server login mengembalikannya (kalau tidak ada,
-  // baris ini tidak tampil — tidak diasumsikan).
-  if (user) {
-    const info = [];
-    if (user.level !== undefined) info.push(`level: ${user.level}`);
-    if (user.xp !== undefined) info.push(`xp: ${user.xp}`);
-    if (user.gems !== undefined) info.push(`gems: ${user.gems}`);
-    if (info.length > 0) console.log(`${tag} [Upgrade] Akun: ${info.join(' | ')}`);
-  }
-
-  let upgrades;
-  try {
-    upgrades = await api('GET', '/api/upgrades', null, address, token);
-  } catch (e) {
-    console.log(`${tag} [Upgrade] GET /api/upgrades failed: ${e.message}`);
-    results.push({ upgrade: upgradeType, attempt: 0, total: repeatCount, status: 'GAGAL', detail: `GET /api/upgrades failed: ${e.message}` });
-    return results;
-  }
-  if (!Array.isArray(upgrades)) upgrades = upgrades.upgrades || upgrades.items || [];
-  // Simpan respons mentah saat login, supaya hasil test lewat skrip bisa
-  // dicek: kalau respons login ternyata berisi field level / tier / beli
-  // yang tidak ada di API publik, itu akan kelihatan di file ini.
-  try { fs.appendFileSync('upgrades_debug.txt', `${address}|${JSON.stringify(upgrades)}\n`); } catch {}
-  if (upgrades.length === 0) {
-    console.log(`${tag} [Upgrade] Tidak ada upgrade dari /api/upgrades`);
-    results.push({ upgrade: upgradeType, attempt: 0, total: repeatCount, status: 'SKIP', detail: 'Tidak ada upgrade dari /api/upgrades' });
-    return results;
-  }
-
-  const LEVEL_FIELDS = ['requiredLevel', 'unlockLevel', 'minLevel', 'levelRequired', 'required_level', 'unlock_level'];
-  const show = (u) => {
-    const parts = [`${u.name || u.id} (${u.id})`, `type: ${u.type || '-'}`];
-    if (u.increment !== undefined) parts.push(`+${u.increment}`);
-    if (u.cost !== undefined) parts.push(`biaya: ${u.cost}`);
-    for (const f of LEVEL_FIELDS) if (u[f] !== undefined) parts.push(`${f}: ${u[f]}`);
-    if (u.level !== undefined) parts.push(`level: ${u.level}`);
-    if (u.maxLevel !== undefined) parts.push(`maxLevel: ${u.maxLevel}`);
-    if (u.maxCapacity !== undefined) parts.push(`maxCapacity: ${u.maxCapacity}`);
-    if (u.currentCapacity !== undefined) parts.push(`currentCapacity: ${u.currentCapacity}`);
-    if (u.isCapped !== undefined) parts.push(`isCapped: ${u.isCapped}`);
-    console.log(`${tag} [Upgrade] ${parts.join(' | ')}`);
-  };
-
-  const list = upgradeType === 'all' ? upgrades : upgrades.filter(u => u.type === upgradeType);
-  if (list.length === 0) {
-    console.log(`${tag} [Upgrade] Skip akun ini: tidak ada upgrade type '${upgradeType}' di daftar akun ini (kemungkinan belum unlock untuk level akun ini). Akun lain tetap lanjut. Daftar lengkap akun ini:`);
-    upgrades.forEach(show);
-    results.push({ upgrade: upgradeType, attempt: 0, total: repeatCount, status: 'SKIP', detail: 'Tidak ada upgrade type ini di daftar akun ini (kemungkinan belum unlock)' });
-    return results;
-  }
-  list.forEach(show);
-  if (repeatCount > 1) {
-    const est = list.map(u => `${u.name || u.id}: ${u.cost} x ${repeatCount} = ${u.cost !== undefined ? u.cost * repeatCount : '?'}`).join(', ');
-    console.log(`${tag} [Upgrade] Jumlah beli: ${repeatCount}x per upgrade | Estimasi total: ${est}`);
-  }
-
-  // Beli: repeatCount x per upgrade terpilih, per akun. Gagal di satu
-  // percobaan menghentikan pengulangan upgrade itu saja (mis. gems habis
-  // / sudah capped, percobaan berikutnya pasti gagal juga), tapi tidak
-  // menghentikan upgrade lain / akun lain (loop utama juga punya
-  // try/catch per akun).
-  for (const upg of list) {
-    for (let n = 1; n <= repeatCount; n++) {
-      try {
-        const res = await api('POST', `/api/upgrades/${upg.id}`, null, address, token);
-        const u = res.user || {};
-        const stats = [];
-        if (u.miningPower !== undefined) stats.push(`miningPower: ${u.miningPower}`);
-        if (u.energyCapacity !== undefined) stats.push(`energyCapacity: ${u.energyCapacity}`);
-        if (u.miningSpeed !== undefined) stats.push(`miningSpeed: ${u.miningSpeed}`);
-        if (u.gems !== undefined) stats.push(`gems: ${u.gems}`);
-        console.log(`${tag} [Upgrade] BOUGHT (${n}/${repeatCount}): ${upg.name || upg.id} | GET biaya: ${upg.cost} | ${res.message || 'success'}${stats.length ? ` | ${stats.join(' | ')}` : ''}`);
-        results.push({ upgrade: upg.name || upg.id, attempt: n, total: repeatCount, status: 'BERHASIL', detail: stats.join(' | ') });
-      } catch (e) {
-        console.log(`${tag} [Upgrade] Buy failed (${n}/${repeatCount}): ${upg.name || upg.id} | ${e.message} | berhenti mengulang upgrade ini`);
-        results.push({ upgrade: upg.name || upg.id, attempt: n, total: repeatCount, status: 'GAGAL', detail: e.message });
-        break;
-      }
+      await api('POST', '/api/mining/positions', { locationId: loc.id }, address, token);
+      started++;
+      energy -= loc.energyCost;
+      console.log(`${tag} [⛏ ${started}] ${loc.name} | ${loc.durationSeconds}s | energy left: ${energy}`);
       await randomDelay();
+    } catch (e) {
+      if (/lock|level|power|require/i.test(e.message)) {
+        // The server won't allow this location — remember it and try the next one
+        if (!rejectedLocs.has(address)) rejectedLocs.set(address, new Set());
+        rejectedLocs.get(address).add(loc.id);
+        console.log(`${tag} ${loc.name} unavailable: ${e.message} — trying next`);
+        continue;
+      }
+      console.log(`${tag} Mining stopped: ${e.message}`);
+      break;
     }
   }
-  return results;
-}
 
-// ─── SHOP / TRADE (MODE TERPISAH DARI UPGRADE) ───────────────────────────────
-// Sistem BERBEDA dari /api/upgrades: ini beli alat (equipment) yang masuk
-// inventory, bukan stat increment langsung.
-// Endpoint TERVERIFIKASI dari Network tab user (bukan tebakan):
-//   POST /api/shop/purchase  body: { itemId: "..." }  -> 200, success true
-// Contoh terverifikasi: { itemId: "copper-turbo-drill" } -> Copper Turbo
-// Drill (+15 Mining Power, 1000 GEMS), miningPower 12 -> 27,
-// gems 3444.25 -> 2444.25.
-// Daftar di bawah dari SS items user 2026-11-03; daftar ini MUNGKIN TIDAK
-// LENGKAP dan harga/efek bisa berubah — yang jadi patokan beli adalah
-// itemId yang dipilih di menu, dan respons server (gems/stat baru).
-// Item yang masih terkunci untuk akun itu akan gagal di server (log
-// Buy failed) dan tidak menghentikan akun lain. Item yang SUDAH DIMILIKI
-// tidak perlu / tidak bisa dibeli ulang: tombolnya tidak bisa diklik dan
-// bukan purchase lagi (info user 2026-11-03), jadi mode ini tetap 1x
-// per item per jalan, tanpa pilihan pengulangan. TIDAK ADA pilihan "Semua"
-// di mode ini, sengaja, supaya tidak belanja besar tanpa sengaja:
-// total semua item di daftar ini > 50000 GEMS.
-// Energy Pack itu consumable (+5 energy sekali pakai), bukan alat permanen.
-const SHOP_ITEMS = [
-  { id: 'rusty-pickaxe',     name: 'Rusty Pickaxe',     effect: '+0 Mining Power', price: 10 },
-  { id: 'iron-pickaxe',      name: 'Iron Pickaxe',      effect: '+2 Mining Power', price: 100 },
-  { id: 'energy-pack',       name: 'Energy Pack',       effect: '+5 energy (consumable)', price: 150 },
-  { id: 'iron-drill',        name: 'Iron Drill',        effect: '+6 Mining Power', price: 350 },
-  { id: 'copper-turbo-drill', name: 'Copper Turbo Drill', effect: '+15 Mining Power', price: 1000 },
-  { id: 'ruby-laser',        name: 'Ruby Laser',        effect: '+35 Mining Power', price: 3500 },
-  { id: 'cryo-plasma-drill', name: 'Cryo Plasma Drill', effect: '+80 Mining Power', price: 10000 },
-  { id: 'void-annihilator',  name: 'Void Annihilator',  effect: '+200 Mining Power', price: 35000 },
-];
-
-async function doShop(session, tag, shopItem) {
-  const { address, token, user } = session;
-  if (!shopItem) { console.log(`${tag} [Shop] Tidak ada item terpilih`); return null; }
-
-  // Cek saldo dari login dulu (kalau server login mengembalikannya).
-  // Ini hanya pra-cek; keputusan akhir tetap di server saat POST.
-  if (user && user.gems !== undefined && user.gems < shopItem.price) {
-    console.log(`${tag} [Shop] Skip: gems ${user.gems} < harga ${shopItem.price} (${shopItem.name})`);
-    return { item: shopItem.name, status: 'GAGAL', locked: false, detail: `gems ${user.gems} < harga ${shopItem.price}` };
-  }
-
-  // TIDAK ADA endpoint GET daftar shop yang terverifikasi, jadi status
-  // lock hanya bisa ketahuan dari respons POST: kalau server menolak
-  // karena terkunci, error-nya ditandai locked dan ditampilkan lengkap
-  // di log + ringkasan akhir. Kalau sudah unlock dan berhasil, tidak
-  // perlu detail tambahan di ringkasan.
-  console.log(`${tag} [Shop] Beli: ${shopItem.name} (${shopItem.id}) | ${shopItem.effect} | harga: ${shopItem.price} GEMS`);
-  try {
-    const res = await api('POST', '/api/shop/purchase', { itemId: shopItem.id }, address, token);
-    const u = res.user || {};
-    const stats = [];
-    if (u.miningPower !== undefined) stats.push(`miningPower: ${u.miningPower}`);
-    if (u.energyCapacity !== undefined) stats.push(`energyCapacity: ${u.energyCapacity}`);
-    if (u.miningSpeed !== undefined) stats.push(`miningSpeed: ${u.miningSpeed}`);
-    if (u.energy !== undefined) stats.push(`energy: ${u.energy}`);
-    if (u.gems !== undefined) stats.push(`gems: ${u.gems}`);
-    console.log(`${tag} [Shop] BOUGHT: ${res.item?.name || shopItem.name} | ${stats.length ? stats.join(' | ') : (res.message || 'success')}`);
-    return { item: res.item?.name || shopItem.name, status: 'BERHASIL', locked: false, detail: '' };
-  } catch (e) {
-    const locked = /lock|unlock|terkunci|belum terbuka|not unlocked|requires level|level required/i.test(e.message);
-    if (locked) {
-      console.log(`${tag} [Shop] TERKUNCI: ${shopItem.name} belum bisa dibeli akun ini | detail: ${e.message}`);
-      return { item: shopItem.name, status: 'TERKUNCI', locked: true, detail: e.message };
-    }
-    console.log(`${tag} [Shop] Buy failed: ${shopItem.name} | ${e.message}`);
-    return { item: shopItem.name, status: 'GAGAL', locked: false, detail: e.message };
-  }
+  if (started) console.log(`${tag} Positions started: ${started}`);
 }
 
 // ─── CLAIM MINING ─────────────────────────────────────────────────────────────
-async function doClaim(session, tag) {
-  const { address, token } = session;
-  const positions = await api('GET', '/api/mining/positions', null, address, token);
+async function doClaim(s, tag) {
+  const { address, token } = s;
+  const positions = asArray(await api('GET', '/api/mining/positions', null, address, token));
   const claimable = positions.filter(p =>
-    p.status === 'completed' || (p.remainingSeconds !== undefined && p.remainingSeconds <= 0)
-  );
+    p.status === 'completed' || (p.status === 'active' && p.remainingSeconds <= 0));
 
-  if (claimable.length === 0) {
+  if (!claimable.length) {
     const active = positions.filter(p => p.status === 'active');
-    if (active.length > 0) {
-      const s = active.sort((a, b) => a.remainingSeconds - b.remainingSeconds)[0];
-      console.log(`${tag} Still mining: ${s.locationName} | ${s.remainingSeconds}s left`);
+    if (active.length) {
+      const p = soonest(active);
+      console.log(`${tag} Still mining: ${p.locationName} | ${p.remainingSeconds}s left`);
     } else {
       console.log(`${tag} Nothing to claim`);
     }
     return 0;
   }
 
-  let totalGems = 0;
+  let total = 0;
   for (const pos of claimable) {
     try {
       const res = await api('POST', `/api/mining/positions/${pos.id}/claim`, null, address, token);
       const gems = res.gemsEarned || 0;
-      totalGems += gems;
-      console.log(`${tag} Claimed: ${pos.locationName} | +${gems} GEMS | ${res.rewards?.join(', ')}`);
+      total += gems;
+      const extra = Array.isArray(res.rewards) && res.rewards.length ? ` | ${res.rewards.join(', ')}` : '';
+      console.log(`${tag} Claimed: ${pos.locationName} | +${gems} GEMS${extra}`);
     } catch (e) {
       console.log(`${tag} Claim failed: ${e.message}`);
     }
-    await sleep(500);
+    await sleep(500 + Math.random() * 1000);
   }
-  return totalGems;
+  return total;
 }
 
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
-function prompt(q) {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise(res => rl.question(q, ans => { rl.close(); res(ans.trim()); }));
+// ─── TASKS ────────────────────────────────────────────────────────────────────
+const QUESTS = {
+  daily:  ['daily_miner_signin', 'tw_daily_engage'],
+  weekly: ['tw_weekly_post', 'tw_weekly_qrt', 'weekly_miner_checkin'],
+};
+const OPEN_STATUSES = ['available', 'in_progress', 'started', 'ready', 'pending'];
+
+async function doTasks(s, tag, questMode) {
+  const { address, token, user, username } = s;
+
+  if (username && !user.twitterHandle) {
+    try {
+      const r = await api('POST', '/api/user/link-twitter', { twitterHandle: username }, address, token);
+      console.log(`${tag} [Twitter] Linked: @${r.twitterHandle || username}`);
+    } catch (e) {
+      console.log(`${tag} [Twitter] Link failed: ${e.message}`);
+    }
+    await randomDelay();
+  }
+
+  let raw;
+  try {
+    raw = await api('GET', '/api/quests', null, address, token);
+  } catch (e) {
+    console.log(`${tag} [Quest] Failed to fetch list: ${e.message}`);
+    return false;
+  }
+
+  const allowed = QUESTS[questMode];
+  const pool = asArray(raw[questMode]).filter(q => allowed.includes(q.id));
+  const doable = pool.filter(q => OPEN_STATUSES.includes(q.status));
+
+  if (!doable.length) {
+    console.log(`${tag} [Quest] All ${questMode} quests done`);
+    pool.forEach(q => console.log(`${tag}   └ ${q.id}: ${q.status}`));
+    return true;
+  }
+
+  for (const quest of doable) {
+    // Tweet-verification quests need a real tweet URL — skip them, never send fake URLs
+    if (quest.actionType === 'verify_tweet') {
+      console.log(`${tag} [Quest] Skipping "${quest.title}" — needs a real tweet, do it manually`);
+      continue;
+    }
+    try {
+      if (quest.status === 'available') {
+        const st = await api('POST', '/api/quests/start', { questId: quest.id }, address, token);
+        const wait = (st.delaySeconds || st.secondsLeft || 10) + 2;
+        console.log(`${tag} [Quest] Started: ${quest.title} | waiting ${wait}s`);
+        await sleep(wait * 1000);
+      } else {
+        console.log(`${tag} [Quest] Resuming: ${quest.title} (${quest.status})`);
+      }
+
+      const c = await api('POST', '/api/quests/claim', { questId: quest.id }, address, token);
+      console.log(`${tag} [Quest] Claimed: ${quest.title} | +${c.reward?.gems || 0} GEMS +${c.reward?.xp || 0} XP`);
+    } catch (e) {
+      console.log(`${tag} [Quest] "${quest.title}" error: ${e.message}`);
+    }
+    await randomDelay();
+  }
+  return true;
 }
 
-function selectKeys(keys, scope, from) {
-  if (scope === '1') return [{ key: keys[from - 1], idx: from - 1 }];
-  if (scope === '3') return keys.slice(from - 1).map((k, i) => ({ key: k, idx: from - 1 + i }));
-  return keys.map((k, i) => ({ key: k, idx: i }));
+// ─── UPGRADES ─────────────────────────────────────────────────────────────────
+// POST /api/upgrades/{id} with no body = one purchase (+increment). Can be repeated with the same id.
+// Prices differ per account — take them from that account's GET /api/upgrades.
+const UPGRADE_TYPES = [
+  { type: 'miningPower',    name: 'Mining Power' },
+  { type: 'energyCapacity', name: 'Energy Capacity' },
+  { type: 'miningSpeed',    name: 'Mining Speed' },
+];
+
+function statsLine(u = {}) {
+  return [
+    u.miningPower !== undefined && `power: ${u.miningPower}`,
+    u.energyCapacity !== undefined && `energyCap: ${u.energyCapacity}`,
+    u.miningSpeed !== undefined && `speed: ${u.miningSpeed}`,
+    u.energy !== undefined && `energy: ${u.energy}`,
+    u.gems !== undefined && `gems: ${u.gems}`,
+  ].filter(Boolean).join(' | ');
 }
+
+// reserve — GEMS to keep (buy only if at least `reserve` remains afterwards)
+async function doUpgrades(s, tag, types, count, reserve = 0) {
+  const { address, token } = s;
+  const results = [];
+  let gems = s.user.gems;
+
+  let upgrades;
+  try {
+    const raw = await api('GET', '/api/upgrades', null, address, token);
+    upgrades = asArray(raw).length ? asArray(raw) : asArray(raw.upgrades || raw.items);
+  } catch (e) {
+    console.log(`${tag} [Upgrade] Failed to fetch list: ${e.message}`);
+    return [{ name: '—', ok: 0, fail: 1, detail: e.message }];
+  }
+
+  for (const t of types) {
+    const upg = upgrades.find(u => u.type === t);
+    if (!upg) {
+      console.log(`${tag} [Upgrade] ${t}: not in this account's list (still locked?) — skipping`);
+      results.push({ name: t, ok: 0, fail: 0, detail: 'not in list' });
+      continue;
+    }
+    const r = { name: upg.name || upg.id, ok: 0, fail: 0, detail: '' };
+    console.log(`${tag} [Upgrade] ${r.name} | +${upg.increment ?? '?'} | price: ${upg.cost ?? '?'} GEMS${gems !== undefined ? ` | balance: ${gems}` : ''}`);
+
+    for (let n = 1; n <= count; n++) {
+      if (gems !== undefined && upg.cost !== undefined && gems - upg.cost < reserve) {
+        r.detail = `not enough GEMS (${gems}, price ${upg.cost}${reserve ? `, reserve ${reserve}` : ''})`;
+        console.log(`${tag} [Upgrade] Stop: ${r.detail}`);
+        break;
+      }
+      try {
+        const res = await api('POST', `/api/upgrades/${upg.id}`, null, address, token);
+        r.ok++;
+        if (res.user?.gems !== undefined) gems = res.user.gems;
+        else if (gems !== undefined && upg.cost !== undefined) gems -= upg.cost;
+        console.log(`${tag} [Upgrade] Bought ${n}/${count}: ${r.name} | ${statsLine(res.user) || res.message || 'ok'}`);
+      } catch (e) {
+        r.fail++;
+        r.detail = e.message;
+        console.log(`${tag} [Upgrade] Failed ${n}/${count}: ${r.name} | ${e.message} — not repeating`);
+        break;
+      }
+      if (n < count) await randomDelay();
+    }
+    results.push(r);
+    await randomDelay();
+  }
+  s.user.gems = gems;
+  return results;
+}
+
+// ─── SHOP ─────────────────────────────────────────────────────────────────────
+// POST /api/shop/purchase { itemId }. Items and prices may change — the server decides.
+// Equipment you already own can't be bought again; Energy Pack is a consumable.
+const SHOP_ITEMS = [
+  { id: 'rusty-pickaxe',      name: 'Rusty Pickaxe',      effect: '+0 power',  price: 10 },
+  { id: 'iron-pickaxe',       name: 'Iron Pickaxe',       effect: '+2 power',  price: 100 },
+  { id: 'energy-pack',        name: 'Energy Pack',        effect: '+5 energy, consumable', price: 150 },
+  { id: 'iron-drill',         name: 'Iron Drill',         effect: '+6 power',  price: 350 },
+  { id: 'copper-turbo-drill', name: 'Copper Turbo Drill', effect: '+15 power', price: 1000 },
+  { id: 'ruby-laser',         name: 'Ruby Laser',         effect: '+35 power', price: 3500 },
+  { id: 'cryo-plasma-drill',  name: 'Cryo Plasma Drill',  effect: '+80 power', price: 10000 },
+  { id: 'void-annihilator',   name: 'Void Annihilator',   effect: '+200 power', price: 35000 },
+];
+
+async function doShop(s, tag, item, reserve = 0) {
+  const { address, token, user } = s;
+  if (user.gems !== undefined && user.gems - item.price < reserve) {
+    console.log(`${tag} [Shop] Skipping: ${user.gems} GEMS, price ${item.price}${reserve ? `, reserve ${reserve}` : ''} (${item.name})`);
+    return { name: item.name, ok: 0, fail: 1, detail: `not enough GEMS (${user.gems})` };
+  }
+  try {
+    const res = await api('POST', '/api/shop/purchase', { itemId: item.id }, address, token);
+    if (res.user?.gems !== undefined) user.gems = res.user.gems;
+    else if (user.gems !== undefined) user.gems -= item.price;
+    console.log(`${tag} [Shop] Bought: ${res.item?.name || item.name} | ${statsLine(res.user) || res.message || 'ok'}`);
+    return { name: item.name, ok: 1, fail: 0, detail: '' };
+  } catch (e) {
+    const owned = /owned|already/i.test(e.message);
+    const locked = owned || /lock|level/i.test(e.message);
+    console.log(`${tag} [Shop] ${locked ? 'Unavailable' : 'Error'}: ${item.name} | ${e.message}`);
+    return { name: item.name, ok: 0, fail: 1, owned, detail: e.message };
+  }
+}
+
+// ─── AUTO 24/7 ────────────────────────────────────────────────────────────────
+const time = () => new Date().toLocaleTimeString('en-GB');
+const dayKey = () => new Date().toISOString().slice(0, 10); // UTC date
+function weekKey() {
+  const d = new Date();
+  const monday = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - ((d.getUTCDay() + 6) % 7)));
+  return monday.toISOString().slice(0, 10);
+}
+const fmtWait = sec => (sec >= 3600 ? `${Math.floor(sec / 3600)}h ${Math.round((sec % 3600) / 60)}m`
+  : sec >= 60 ? `${Math.floor(sec / 60)}m ${Math.round(sec % 60)}s` : `${Math.round(sec)}s`);
+
+// Seconds until the nearest position finishes (null = no active positions)
+async function nextReadySeconds(s) {
+  const active = asArray(await api('GET', '/api/mining/positions', null, s.address, s.token))
+    .filter(p => p.status === 'active');
+  return active.length ? Math.max(0, soonest(active).remainingSeconds) : null;
+}
+
+// buy (optional): { upgTypes, upgCount, shopItem, reserve } — purchases every cycle
+async function autoLoop(indexes, buy = null) {
+  const done = {}; // idx → { daily, weekly, shop } — what's already done
+  let totalGems = 0;
+
+  for (let cycle = 1; !CFG.autoCycles || cycle <= CFG.autoCycles; cycle++) {
+    console.log(`\n══════ Cycle ${cycle} | ${time()} ══════`);
+    let waitSec = CFG.autoMaxWait;
+
+    for (let i = 0; i < indexes.length; i++) {
+      const idx = indexes[i];
+      const prefix = `[${i + 1}/${indexes.length}]`;
+      const st = (done[idx] ||= {});
+
+      let s;
+      try {
+        s = await login(CFG.keys[idx]); // fresh login every cycle so the token never expires
+        s.username = CFG.usernames[idx] || null;
+      } catch (e) {
+        console.error(`${prefix} ${time()} Login error (account #${idx + 1}): ${e.message}`);
+        waitSec = Math.min(waitSec, rand(...CFG.autoIdle) / 3);
+        continue;
+      }
+
+      const tag = `${prefix}[${s.address.slice(0, 8)}…]`;
+      console.log(`${tag} ${time()} Energy: ${s.user.energy ?? '?'}/${s.user.energyCapacity ?? '?'}`);
+      try {
+        const claimed = await doClaim(s, tag);
+        totalGems += claimed;
+        if (s.user.gems !== undefined) s.user.gems += claimed;
+        await randomDelay();
+
+        // Buy before mining so new energy / power is used right away
+        if (buy?.upgTypes) {
+          await doUpgrades(s, tag, buy.upgTypes, buy.upgCount, buy.reserve);
+        }
+        if (buy?.shopItem && !st.shop) {
+          const r = await doShop(s, tag, buy.shopItem, buy.reserve);
+          // Equipment is bought once; Energy Pack is a consumable, bought every cycle
+          if (buy.shopItem.id !== 'energy-pack' && (r.ok || r.owned)) st.shop = true;
+          await randomDelay();
+        }
+
+        await doMining(s, tag);
+
+        if (st.daily !== dayKey()) {
+          await randomDelay();
+          if (await doTasks(s, tag, 'daily')) st.daily = dayKey();
+        }
+        if (st.weekly !== weekKey()) {
+          await randomDelay();
+          if (await doTasks(s, tag, 'weekly')) st.weekly = weekKey();
+        }
+
+        const ready = await nextReadySeconds(s);
+        waitSec = Math.min(waitSec, ready ?? rand(...CFG.autoIdle));
+      } catch (e) {
+        console.error(`${tag} Error: ${e.message}`);
+      }
+
+      if (i < indexes.length - 1) await accountDelay();
+    }
+
+    console.log(`\nTotal GEMS claimed this session: ${totalGems}`);
+    if (CFG.autoCycles && cycle >= CFG.autoCycles) break;
+
+    const sleepSec = Math.min(CFG.autoMaxWait, Math.max(CFG.autoMinWait, waitSec + rand(...CFG.autoExtra)));
+    const wake = new Date(Date.now() + sleepSec * 1000).toLocaleTimeString('en-GB');
+    console.log(`💤 Next cycle in ${fmtWait(sleepSec)} (at ${wake}). Press Ctrl+C to stop`);
+    await sleep(sleepSec * 1000);
+  }
+}
+
+// ─── CLI ──────────────────────────────────────────────────────────────────────
+// Line queue: answers aren't lost even if input arrives before the question (e.g. via a pipe)
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: process.stdin.isTTY });
+const lines = [];
+const waiters = [];
+rl.on('line', l => (waiters.length ? waiters.shift()(l.trim()) : lines.push(l.trim())));
+rl.on('close', () => { while (waiters.length) waiters.shift()(null); });
+function ask(q) {
+  process.stdout.write(q);
+  if (lines.length) return Promise.resolve(lines.shift());
+  return new Promise(res => waiters.push(a => {
+    if (a === null) { console.error('\n[!] Input closed'); process.exit(1); }
+    res(a);
+  }));
+}
+
+async function askChoice(title, options) {
+  console.log(`\n${title}`);
+  options.forEach((o, i) => console.log(`  ${i + 1}. ${o}`));
+  for (;;) {
+    const a = Number(await ask(`Choice (1-${options.length}): `));
+    if (Number.isInteger(a) && a >= 1 && a <= options.length) return a;
+    console.log('[!] Invalid input');
+  }
+}
+
+async function askIndex(label, max) {
+  for (;;) {
+    const n = Number(await ask(`${label} (1-${max}): `));
+    if (Number.isInteger(n) && n >= 1 && n <= max) return n;
+    console.log('[!] Invalid number');
+  }
+}
+
+const isYes = a => /^(y|yes|да)$/i.test(a);
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  const keys = fs.readFileSync('wallet.txt', 'utf-8')
-    .split('\n').map(l => l.trim()).filter(Boolean);
-
-  const usernames = fs.existsSync('usn.txt')
-    ? fs.readFileSync('usn.txt', 'utf-8').split('\n').map(l => l.trim().replace(/^@/, '')).filter(Boolean)
-    : [];
-
-  const akunList = parseAkun();
-
-  console.log(`Wallets  : ${keys.length}`);
-  console.log(`Usernames: ${usernames.length}`);
-  console.log(`Akun tw  : ${akunList.length}`);
-
-  // Pilih scope
-  console.log(`\nAkun:`);
-  console.log(`  1. 1 akun`);
-  console.log(`  2. Semua`);
-  console.log(`  3. From X to end`);
-  const scope = await prompt('\nPilih (1/2/3): ');
-  let from = 1;
-  if (scope === '1') from = parseInt(await prompt(`Nomor akun (1-${keys.length}): `));
-  else if (scope === '3') from = parseInt(await prompt(`Mulai dari nomor (1-${keys.length}): `));
-
-  // Pilih mode
-  console.log(`\nMode:`);
-  console.log(`  1. Mining + Task`);
-  console.log(`  2. Mining`);
-  console.log(`  3. Claim`);
-  console.log(`  4. Task`);
-  console.log(`  5. Upgrade Mining`);
-  console.log(`  6. Shop (Beli Alat Mining)`);
-  const mode = await prompt('\nPilih (1/2/3/4/5/6): ');
-  if (!['1','2','3','4','5','6'].includes(mode)) { console.log('[!] Invalid'); return; }
-
-  // Pilih sub-mode task kalau mode 1 atau 4
-  let questMode = null;
-  if (['1','4'].includes(mode)) {
-    console.log(`\nTask mode:`);
-    console.log(`  1. Daily`);
-    console.log(`  2. Weekly`);
-    console.log(`  3. One-Time`);
-    const tm = await prompt('\nPilih (1/2/3): ');
-    questMode = tm === '2' ? 'weekly' : tm === '3' ? 'oneTime' : 'daily';
+  if (!CFG.keys.length) {
+    console.error('[!] PRIVATE_KEYS in .env is empty');
+    process.exit(1);
   }
+  console.log(`Wallets  : ${CFG.keys.length}`);
+  console.log(`Usernames: ${CFG.usernames.length}`);
+  console.log(`Ref code : ${CFG.refCode || '—'}`);
 
-  // Pilih sub-menu upgrade kalau mode 5 (satu jenis per pilihan, karena
-  // tiap upgrade beda type dan efek — lihat doUpgrades).
-  // Harga TIDAK ditulis di menu ini karena terbukti beda per akun saat
-  // login (contoh test: Energy Capacity 360, bukan 180 di API publik).
-  // Harga asli per akun selalu tampil di output mode 5.
-  let upgradeType = null;
-  let upgradeCount = 1;
-  if (mode === '5') {
-    console.log(`\nUpgrade mining:`);
-    console.log(`  1. Mining Power`);
-    console.log(`  2. Energy Capacity`);
-    console.log(`  3. Mining Speed`);
-    console.log(`  4. Semua (tampilkan semua upgrade)`);
-    const um = await prompt('\nPilih (1/2/3/4): ');
-    upgradeType = um === '2' ? 'energyCapacity' : um === '3' ? 'miningSpeed' : um === '4' ? 'all' : 'miningPower';
-    // Berapa kali beli per upgrade terpilih, per akun. 1 = perilaku lama.
-    // Beli ulang upgrade itu terverifikasi bisa (endpoint + id sama, +5
-    // lagi per klik), jadi angka > 1 di sini memang sengaja mengulang.
-    const uc = parseInt(await prompt('Berapa kali upgrade (1 = sekali, mis. 3 untuk +15 power): '));
-    upgradeCount = Math.max(1, uc || 1);
+  const scope = await askChoice('Accounts:', ['One', 'All', 'From N to end']);
+  let indexes = CFG.keys.map((_, i) => i);
+  if (scope === 1) indexes = [(await askIndex('Account number', CFG.keys.length)) - 1];
+  if (scope === 3) indexes = indexes.slice((await askIndex('Start from number', CFG.keys.length)) - 1);
+
+  const mode = await askChoice('Mode:', [
+    'Mining + Quests', 'Mining', 'Claim rewards', 'Quests',
+    'Auto 24/7 (claim + mining + quests in a loop)',
+    'Upgrades — spends GEMS', 'Shop — spends GEMS',
+    'Auto 24/7 + Upgrades + Shop (5+6+7) — spends GEMS',
+  ]);
+  if (mode === 5) {
+    rl.close();
+    return autoLoop(indexes);
   }
+  if (mode === 8) {
+    const reserve = CFG.gemsReserve;
+    const u = await askChoice('Upgrades every cycle:', [...UPGRADE_TYPES.map(t => t.name), 'All of them', "Don't buy"]);
+    const upgTypes = u > UPGRADE_TYPES.length + 1 ? null
+      : u > UPGRADE_TYPES.length ? UPGRADE_TYPES.map(t => t.type) : [UPGRADE_TYPES[u - 1].type];
+    const upgCount = upgTypes ? await askIndex('How many of each per cycle', 50) : 0;
+    const it = await askChoice('Shop:', [
+      ...SHOP_ITEMS.map(x => `${x.name} (${x.effect}) — ${x.price} GEMS`), "Don't buy"]);
+    const shopItem = SHOP_ITEMS[it - 1] || null;
 
-  // Pilih sub-menu shop kalau mode 6 (mode TERPISAH dari mode 5).
-  // Satu item per pilihan, TANPA pilihan "Semua" — sengaja, supaya
-  // tidak belanja puluhan ribu GEMS tanpa sengaja. Item yang masih
-  // terkunci untuk akun itu akan gagal di server dan di-log, bukan
-  // memaksa beli.
-  let shopItem = null;
-  if (mode === '6') {
-    console.log(`\nShop (beli alat mining, 1 item per akun):`);
-    SHOP_ITEMS.forEach((it, i) => console.log(`  ${i + 1}. ${it.name} (${it.effect}, ${it.price} GEMS)`));
-    const sm = parseInt(await prompt(`\nPilih (1-${SHOP_ITEMS.length}): `));
-    shopItem = SHOP_ITEMS[sm - 1] || null;
-    if (!shopItem) { console.log('[!] Invalid shop item'); return; }
+    console.log(`\n⚠️  Auto 24/7 on ${indexes.length} account(s). Every cycle:`);
+    console.log(`   Upgrades: ${upgTypes ? `${upgTypes.join(', ')} × ${upgCount}` : 'none'}`);
+    console.log(`   Shop    : ${shopItem ? `${shopItem.name} (${shopItem.price} GEMS)${shopItem.id === 'energy-pack' ? ' — every cycle' : ' — once'}` : 'none'}`);
+    console.log(`   Reserve : ${reserve} GEMS are never spent (AUTO_GEMS_RESERVE in .env)`);
+    const yes = await ask('Confirm? Type "yes": ');
+    rl.close();
+    if (!isYes(yes)) return console.log('Cancelled.');
+    return autoLoop(indexes, (upgTypes || shopItem) ? { upgTypes, upgCount, shopItem, reserve } : null);
   }
+  const questMode = [1, 4].includes(mode)
+    ? ((await askChoice('Quests:', ['Daily', 'Weekly'])) === 2 ? 'weekly' : 'daily')
+    : null;
 
-  // Ambil selected
-  const allSelected = selectKeys(keys, scope, from);
+  let upgTypes = null, upgCount = 1, shopItem = null;
+  if (mode === 6) {
+    const u = await askChoice('What to upgrade:', [...UPGRADE_TYPES.map(t => t.name), 'All of them']);
+    upgTypes = u > UPGRADE_TYPES.length ? UPGRADE_TYPES.map(t => t.type) : [UPGRADE_TYPES[u - 1].type];
+    upgCount = await askIndex('How many times to buy each upgrade', 50);
+  }
+  if (mode === 7) {
+    const it = await askChoice('What to buy (1 per account):',
+      SHOP_ITEMS.map(x => `${x.name} (${x.effect}) — ${x.price} GEMS`));
+    shopItem = SHOP_ITEMS[it - 1];
+  }
+  if (mode === 6 || mode === 7) {
+    const what = mode === 6
+      ? `${upgTypes.length} upgrade(s) × ${upgCount} (price differs per account)`
+      : `${shopItem.name} for ${shopItem.price} GEMS (up to ${shopItem.price * indexes.length} total)`;
+    console.log(`\n⚠️  Will buy on ${indexes.length} account(s): ${what}`);
+    const yes = await ask('Confirm? Type "yes": ');
+    if (!isYes(yes)) {
+      console.log('Cancelled.');
+      rl.close();
+      return;
+    }
+  }
+  rl.close();
 
-  const total = allSelected.length;
   let totalGems = 0;
-  // Ringkasan akhir mode 5 / 6: { akun (nomor wallet.txt, 1-based),
-  // address, ...hasil doUpgrades/doShop }.
-  const upgradeSummary = [];
-  const shopSummary = [];
+  const summary = [];
+  for (let i = 0; i < indexes.length; i++) {
+    const idx = indexes[i];
+    const prefix = `[${i + 1}/${indexes.length}]`;
 
-  for (let i = 0; i < total; i++) {
-    const { key, idx } = allSelected[i];
-    const num = `[${i + 1}/${total}]`;
-
-    // Login
     let s;
     try {
-      s = await login(key);
-      s.username = usernames[idx] || null;
-      s.twCreds  = akunList[idx]  || null;
-      s.acctIdx  = idx;
-      console.log(`\n${num} ${s.address} | Energy: ${s.user.energy}/${s.user.energyCapacity} | Twitter: ${s.user.twitterHandle || '-'}`);
+      s = await login(CFG.keys[idx]);
+      s.username = CFG.usernames[idx] || null;
+      console.log(`\n${prefix} ${s.address} | Energy: ${s.user.energy ?? '?'}/${s.user.energyCapacity ?? '?'} | Twitter: ${s.user.twitterHandle || '-'}`);
     } catch (e) {
-      console.error(`${num} Login error: ${e.message}`);
+      console.error(`\n${prefix} Login error (account #${idx + 1}): ${e.message}`);
       continue;
     }
 
-    const tag = `${num}[${s.address.slice(0, 8)}...]`;
-
-    // Action
+    const tag = `${prefix}[${s.address.slice(0, 8)}…]`;
     try {
-      if (mode === '1') {
-        await doMining(s, tag);
-        await randomDelay();
-        await doTasks(s, tag, s.username, questMode, s.twCreds, s.acctIdx);
-      } else if (mode === '2') {
-        await doMining(s, tag);
-      } else if (mode === '3') {
-        const gems = await doClaim(s, tag);
-        totalGems += gems;
-      } else if (mode === '4') {
-        await doTasks(s, tag, s.username, questMode, s.twCreds, s.acctIdx);
-      } else if (mode === '5') {
-        const res5 = await doUpgrades(s, tag, upgradeType, upgradeCount) || [];
-        res5.forEach(r => upgradeSummary.push({ akun: idx + 1, address: s.address, ...r }));
-      } else if (mode === '6') {
-        const res6 = await doShop(s, tag, shopItem);
-        if (res6) shopSummary.push({ akun: idx + 1, address: s.address, ...res6 });
-      }
+      if (mode === 1 || mode === 2) await doMining(s, tag);
+      if (mode === 1) await randomDelay();
+      if (mode === 1 || mode === 4) await doTasks(s, tag, questMode);
+      if (mode === 3) totalGems += await doClaim(s, tag);
+      if (mode === 6) (await doUpgrades(s, tag, upgTypes, upgCount)).forEach(r => summary.push({ acc: idx + 1, ...r }));
+      if (mode === 7) summary.push({ acc: idx + 1, ...(await doShop(s, tag, shopItem)) });
     } catch (e) {
       console.error(`${tag} Error: ${e.message}`);
     }
 
-    if (i < total - 1) await accountDelay();
+    if (i < indexes.length - 1) await accountDelay();
   }
 
-  if (mode === '3') console.log(`\nTotal GEMS claimed: ${totalGems}`);
-
-  // Ringkasan akhir upgrade: berhasil + gagal per akun + upgrade, supaya
-  // langsung kelihatan akun mana yang gagal dan upgrade apa.
-  if (upgradeSummary.length > 0) {
-    const ok = upgradeSummary.filter(r => r.status === 'BERHASIL').length;
-    const fail = upgradeSummary.filter(r => r.status !== 'BERHASIL').length;
-    console.log(`\n=== RINGKASAN UPGRADE: ${ok} berhasil, ${fail} gagal/skip ===`);
-    upgradeSummary.forEach(r => {
-      const attempt = r.total > 1 || r.attempt > 0 ? ` (${r.attempt}/${r.total})` : '';
-      console.log(`  Akun ${r.akun} (${r.address.slice(0, 8)}...): ${r.upgrade}${attempt} - ${r.status}${r.detail ? ` | ${r.detail}` : ''}`);
-    });
+  if (mode === 3) console.log(`\nTotal GEMS claimed: ${totalGems}`);
+  if (summary.length) {
+    console.log(`\n═══ Purchase summary ═══`);
+    summary.forEach(r => console.log(`  Account ${r.acc}: ${r.name} — bought ${r.ok}${r.detail ? ` | ${r.detail}` : ''}`));
   }
-
-  // Ringkasan akhir shop: item yang masih terkunci ditampilkan lengkap
-  // dengan detailnya, supaya jelas kenapa tidak bisa dibeli. Item yang
-  // sudah unlock dan berhasil dibeli tidak perlu detail lagi.
-  if (shopSummary.length > 0) {
-    const ok = shopSummary.filter(r => r.status === 'BERHASIL').length;
-    const locked = shopSummary.filter(r => r.status === 'TERKUNCI').length;
-    console.log(`\n=== RINGKASAN SHOP: ${ok} berhasil, ${locked} terkunci ===`);
-    shopSummary.forEach(r => {
-      // Detail hanya untuk yang terkunci, sesuai permintaan: yang sudah
-      // unlock / berhasil tidak perlu detail lagi di ringkasan.
-      const detail = r.locked && r.detail ? ` | detail: ${r.detail}` : '';
-      console.log(`  Akun ${r.akun} (${r.address.slice(0, 8)}...): ${r.item} - ${r.status}${detail}`);
-    });
-  }
-
-  console.log(`\nDone.`);
+  console.log('\nDone.');
 }
 
-main().catch(console.error);
+main().catch(e => {
+  console.error(e);
+  process.exit(1);
+});

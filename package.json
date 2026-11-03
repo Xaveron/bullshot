@@ -1,0 +1,15 @@
+{
+  "name": "bullshot-bot",
+  "version": "1.0.0",
+  "private": true,
+  "main": "bullshot.js",
+  "scripts": {
+    "start": "node bullshot.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ethers": "^6.13.4"
+  }
+}
