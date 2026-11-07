@@ -105,7 +105,18 @@ async function api(method, urlPath, body, address, token) {
   }
 }
 
-const asArray = v => (Array.isArray(v) ? v : Array.isArray(v?.data) ? v.data : []);
+const asArray = v => {
+  if (Array.isArray(v)) return v;
+  if (!v || typeof v !== 'object') return [];
+  for (const k of ['data', 'positions', 'items', 'results', 'locations']) {
+    if (Array.isArray(v[k])) return v[k];
+    if (v[k] && typeof v[k] === 'object') {
+      const inner = asArray(v[k]);
+      if (inner.length) return inner;
+    }
+  }
+  return Object.values(v).find(Array.isArray) || [];
+};
 
 // ─── LOGIN ────────────────────────────────────────────────────────────────────
 async function login(privateKey) {
@@ -209,16 +220,28 @@ async function doMining(s, tag) {
 async function doClaim(s, tag) {
   const { address, token } = s;
   const positions = asArray(await api('GET', '/api/mining/positions', null, address, token));
-  const claimable = positions.filter(p =>
-    p.status === 'completed' || (p.status === 'active' && p.remainingSeconds <= 0));
+  const DONE = ['completed', 'complete', 'ready', 'finished', 'done', 'claimable'];
+  const GONE = ['claimed', 'expired', 'cancelled', 'canceled'];
+  const status = p => String(p.status || '').toLowerCase();
+  const timeUp = p => {
+    if (typeof p.remainingSeconds === 'number') return p.remainingSeconds <= 0;
+    const end = p.endsAt || p.endTime || p.completesAt || p.completedAt || p.endAt;
+    return end ? new Date(end).getTime() <= Date.now() : false;
+  };
+  // Never claim a position that still has time left, whatever its status or flags say
+  const claimable = positions.filter(p => !p.claimed && !GONE.includes(status(p))
+    && !(typeof p.remainingSeconds === 'number' && p.remainingSeconds > 0)
+    && (p.isReady || p.canClaim || p.claimable || DONE.includes(status(p)) || timeUp(p)));
 
   if (!claimable.length) {
-    const active = positions.filter(p => p.status === 'active');
+    const active = positions.filter(p => status(p) === 'active');
     if (active.length) {
       const p = soonest(active);
       console.log(`${tag} Still mining: ${p.locationName} | ${p.remainingSeconds}s left`);
     } else {
-      console.log(`${tag} Nothing to claim`);
+      const counts = {};
+      positions.forEach(p => { counts[status(p) || '?'] = (counts[status(p) || '?'] || 0) + 1; });
+      console.log(`${tag} Nothing to claim (positions: ${positions.length}${positions.length ? ', ' + JSON.stringify(counts) : ''})`);
     }
     return 0;
   }
