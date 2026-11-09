@@ -45,7 +45,7 @@ On Windows you can just double-click `start.bat`.
 | `REF_CODE` | Your referral code (empty = none) |
 | `DELAY_MS` | Delay between actions, ms, range `[min,max]` |
 | `ACCOUNT_DELAY_MS` | Delay between accounts, ms, `[min,max]` |
-| `MINING_LOCATIONS` | Location priority, e.g. `crystal-cavern,greenstone-quarry`; empty = auto |
+| `MINING_LOCATIONS` | Empty = auto (highest tier the account qualifies for); or a manual priority, e.g. `crystal-cavern,greenstone-quarry` |
 | `REQUEST_TIMEOUT_MS` / `REQUEST_RETRIES` | Timeout and retries on network errors / 429 / 5xx |
 | `AUTO_*_WAIT_SEC` | Auto mode wait times, seconds |
 | `AUTO_GEMS_RESERVE` | Mode 8: GEMS balance that is never spent |
@@ -55,7 +55,7 @@ On Windows you can just double-click `start.bat`.
 
 - **Config in `.env`** instead of `wallet.txt` / `usn.txt` / `akun.txt`; no hardcoded referral code
 - **24/7 mode** (5 and 8): calculates when the next position finishes and sleeps until then
-- **Location choice by real requirements** (level and Mining Power) instead of the `isLocked` flag, which the server reports incorrectly. Energy is saved for the best location instead of being spent on a cheaper one
+- **Location choice by real requirements** (level and Mining Power) instead of the `isLocked` flag, which the server reports incorrectly. The bot always mines the highest tier available (Crystal → Ember → Frozen → Void) and moves up automatically as the account levels; energy is saved for it instead of being spent on a cheaper location
 - **GEMS protection**: confirmation before buying, balance reserve, per-account price checks
 - **Reliable networking**: 60s timeout, retries on drops, 429 and 5xx
 - **Input fixes**: an invalid menu number no longer crashes the script, piped answers are not lost

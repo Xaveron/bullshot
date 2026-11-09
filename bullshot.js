@@ -39,7 +39,7 @@ const CFG = {
   delay:       range(process.env.DELAY_MS, [3000, 8000]),
   acctDelay:   range(process.env.ACCOUNT_DELAY_MS, [2000, 6000]),
   minDuration: num(process.env.MIN_LOCATION_SECONDS, 600),
-  locations:   list(process.env.MINING_LOCATIONS), // location id priority; empty = auto (max GEMS)
+  locations:   list(process.env.MINING_LOCATIONS), // manual location priority; empty = auto (highest tier available)
   timeout:     num(process.env.REQUEST_TIMEOUT_MS, 60000),
   retries:     num(process.env.REQUEST_RETRIES, 2),
   // Auto mode (seconds)
@@ -151,12 +151,27 @@ function bestLocation(locations, level, miningPower, address) {
     && (level === undefined || (l.levelRequired || 0) <= level));
 
   if (CFG.locations.length) {
-    // Priority from .env: the first one the account qualifies for
+    // Manual override from .env: the first one the account qualifies for
     return CFG.locations.map(id => ok.find(l => l.id === id)).find(Boolean) || null;
   }
+  // Auto: the highest-tier location the account qualifies for (highest level requirement,
+  // then highest GEMS reward). Higher tiers also pay more GEMS per energy.
   return ok.sort((a, b) =>
-    (b.rewardRanges?.GEMS?.max || 0) - (a.rewardRanges?.GEMS?.max || 0)
+    (b.levelRequired || 0) - (a.levelRequired || 0)
+    || (b.rewardRanges?.GEMS?.max || 0) - (a.rewardRanges?.GEMS?.max || 0)
     || b.durationSeconds - a.durationSeconds)[0] || null;
+}
+
+// Why the next tier above `loc` is still closed (for the log), or '' if there is none
+function nextTierHint(locations, loc, level, miningPower) {
+  const next = locations
+    .filter(l => l.name && (l.levelRequired || 0) > (loc?.levelRequired || 0))
+    .sort((a, b) => (a.levelRequired || 0) - (b.levelRequired || 0))[0];
+  if (!next) return '';
+  const need = [];
+  if (level !== undefined && (next.levelRequired || 0) > level) need.push(`level ${next.levelRequired} (have ${level})`);
+  if ((next.miningPowerRequired || 0) > miningPower) need.push(`power ${next.miningPowerRequired} (have ${miningPower})`);
+  return need.length ? `next: ${next.name} needs ${need.join(', ')}` : '';
 }
 
 function soonest(positions) {
@@ -181,13 +196,20 @@ async function doMining(s, tag) {
   let energy = stats.energy ?? 0;
   let started = 0;
   const level = stats.level ?? s.user.level;
+  const power = stats.miningPower ?? s.user.miningPower ?? 0;
+
+  const first = bestLocation(locations, level, power, address);
+  if (first) {
+    const hint = CFG.locations.length ? 'manual MINING_LOCATIONS' : nextTierHint(locations, first, level, power);
+    console.log(`${tag} Location: ${first.name} (level ${level ?? '?'}, power ${power})${hint ? ` | ${hint}` : ''}`);
+  }
 
   for (;;) {
     // Take the best available location; if there is not enough energy for it, wait
-    // instead of spending energy on a cheaper one (Crystal: 45 GEMS / 20 energy beats Greenstone: 15 / 10)
-    const loc = bestLocation(locations, level, stats.miningPower ?? 0, address);
+    // instead of spending energy on a cheaper one (higher tiers pay more GEMS per energy)
+    const loc = bestLocation(locations, level, power, address);
     if (!loc) {
-      if (!started) console.log(`${tag} No suitable location (level: ${level ?? '?'}, power: ${stats.miningPower ?? '?'})`);
+      if (!started) console.log(`${tag} No suitable location (level: ${level ?? '?'}, power: ${power})`);
       break;
     }
     if (loc.energyCost > energy) {
